@@ -67,15 +67,17 @@ struct tftp_client {
 	size_t rsize;
 	size_t wsize;
 	unsigned int timeoutms;
+	off_t seek;
 };
 
 static struct list_head readers = LIST_INIT(readers);
 static struct list_head writers = LIST_INIT(writers);
 
 static ssize_t tftp_send_data(struct tftp_client *client,
-			      unsigned int block, size_t offset)
+			      unsigned int block, size_t offset, size_t rsize)
 {
 	ssize_t len;
+	size_t send_len;
 	char *buf;
 	char *p;
 
@@ -89,17 +91,29 @@ static ssize_t tftp_send_data(struct tftp_client *client,
 	*p++ = block & 0xff;
 
 	len = pread(client->fd, p, client->blksize, offset);
-	if (len <= 0) {
-		if (len < 0)
-			printf("[TQFTP] failed to read data\n");
+	if (len < 0) {
+		printf("[TQFTP] failed to read data\n");
 		free(buf);
 		return len;
 	}
 
 	p += len;
 
-	// printf("[TQFTP] Sending %zd bytes of DATA\n", p - buf);
-	len = send(client->sock, buf, p - buf, 0);
+	/* If rsize was set, we should limit the data in the response to n bytes */
+	if (rsize != 0) {
+		/* Header (4 bytes) + data size */
+		send_len = 4 + rsize;
+		if (send_len > p - buf) {
+			printf("[TQFTP] requested data of %ld bytes but only read %ld bytes from file, rejecting\n", rsize, len);
+			free(buf);
+			return -EINVAL;
+		}
+	} else {
+		send_len = p - buf;
+	}
+
+	// printf("[TQFTP] Sending %zd bytes of DATA\n", send_len);
+	len = send(client->sock, buf, send_len, 0);
 
 	free(buf);
 
@@ -118,7 +132,8 @@ static int tftp_send_ack(int sock, int block)
 }
 
 static int tftp_send_oack(int sock, size_t *blocksize, size_t *tsize,
-			  size_t *wsize, unsigned int *timeoutms, size_t *rsize)
+			  size_t *wsize, unsigned int *timeoutms, size_t *rsize,
+			  off_t *seek)
 {
 	char buf[512];
 	char *p = buf;
@@ -172,6 +187,15 @@ static int tftp_send_oack(int sock, size_t *blocksize, size_t *tsize,
 		*p++ = '\0';
 	}
 
+	if (seek) {
+		strcpy(p, "seek");
+		p += 5;
+
+		n = sprintf(p, "%zd", *seek);
+		p += n;
+		*p++ = '\0';
+	}
+
 	return send(sock, buf, p - buf, 0);
 }
 
@@ -198,7 +222,7 @@ static int tftp_send_error(int sock, int code, const char *msg)
 
 static void parse_options(const char *buf, size_t len, size_t *blksize,
 			  ssize_t *tsize, size_t *wsize, unsigned int *timeoutms,
-			  size_t *rsize)
+			  size_t *rsize, off_t *seek)
 {
 	const char *opt, *value;
 	const char *p = buf;
@@ -218,6 +242,7 @@ static void parse_options(const char *buf, size_t len, size_t *blksize,
 		 * tsize: total size - request to get file size in bytes
 		 * rsize: read size - how many bytes to send, not full file
 		 * wsize: window size - how many blocks to send without ACK
+		 * seek: offset from beginning of file in bytes to start reading
 		 */
 		if (!strcmp(opt, "blksize")) {
 			*blksize = atoi(value);
@@ -229,6 +254,8 @@ static void parse_options(const char *buf, size_t len, size_t *blksize,
 			*rsize = atoi(value);
 		} else if (!strcmp(opt, "wsize")) {
 			*wsize = atoi(value);
+		} else if (!strcmp(opt, "seek")) {
+			*seek = atoi(value);
 		} else {
 			printf("[TQFTP] Ignoring unknown option '%s' with value '%s'\n", opt, value);
 		}
@@ -247,6 +274,7 @@ static void handle_rrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 	unsigned int timeoutms = 1000;
 	size_t rsize = 0;
 	size_t wsize = 0;
+	off_t seek = 0;
 	bool do_oack = false;
 	int sock;
 	int ret;
@@ -266,13 +294,13 @@ static void handle_rrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 		return;
 	}
 
-	printf("[TQFTP] RRQ: %s (%s)\n", filename, mode);
-
 	if (p < buf + len) {
 		do_oack = true;
 		parse_options(p, len - (p - buf), &blksize, &tsize, &wsize,
-				&timeoutms, &rsize);
+				&timeoutms, &rsize, &seek);
 	}
+
+	printf("[TQFTP] RRQ: %s (mode=%s rsize=%ld seek=%ld)\n", filename, mode, rsize, seek);
 
 	sock = qrtr_open(0);
 	if (sock < 0) {
@@ -308,6 +336,7 @@ static void handle_rrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 	client->rsize = rsize;
 	client->wsize = wsize;
 	client->timeoutms = timeoutms;
+	client->seek = seek;
 
 	// printf("[TQFTP] new reader added\n");
 
@@ -318,9 +347,10 @@ static void handle_rrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 			       tsize ? (size_t*)&tsize : NULL,
 			       wsize ? &wsize : NULL,
 			       &client->timeoutms,
-			       rsize ? &rsize: NULL);
+			       rsize ? &rsize : NULL,
+			       seek ? &seek : NULL);
 	} else {
-		tftp_send_data(client, 1, 0);
+		tftp_send_data(client, 1, 0, 0);
 	}
 }
 
@@ -335,6 +365,7 @@ static void handle_wrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 	unsigned int timeoutms = 1000;
 	size_t rsize = 0;
 	size_t wsize = 0;
+	off_t seek = 0;
 	bool do_oack = false;
 	int sock;
 	int ret;
@@ -355,7 +386,7 @@ static void handle_wrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 	if (p < buf + len) {
 		do_oack = true;
 		parse_options(p, len - (p - buf), &blksize, &tsize, &wsize,
-				&timeoutms, &rsize);
+				&timeoutms, &rsize, &seek);
 	}
 
 	fd = translate_open(filename, O_WRONLY | O_CREAT);
@@ -387,6 +418,7 @@ static void handle_wrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 	client->rsize = rsize;
 	client->wsize = wsize;
 	client->timeoutms = timeoutms;
+	client->seek = seek;
 
 	// printf("[TQFTP] new writer added\n");
 
@@ -397,9 +429,10 @@ static void handle_wrq(const char *buf, size_t len, struct sockaddr_qrtr *sq)
 			       tsize ? (size_t*)&tsize : NULL,
 			       wsize ? &wsize : NULL,
 			       &client->timeoutms,
-			       rsize ? &rsize: NULL);
+			       rsize ? &rsize : NULL,
+			       seek ? &seek : NULL);
 	} else {
-		tftp_send_data(client, 1, 0);
+		tftp_send_data(client, 1, 0, 0);
 	}
 }
 
@@ -434,7 +467,12 @@ static int handle_reader(struct tftp_client *client)
 	opcode = buf[0] << 8 | buf[1];
 	if (opcode == OP_ERROR) {
 		buf[len] = '\0';
-		printf("[TQFTP] Remote returned an error: %d - %s\n", buf[2] << 8 | buf[3], buf + 4);
+		int err = buf[2] << 8 | buf[3];
+		/* "End of Transfer" is not an error, used with stat(2)-like calls */
+		if (err == 9)
+			printf("[TQFTP] Remote returned END OF TRANSFER: %d - %s\n", err, buf + 4);
+		else
+			printf("[TQFTP] Remote returned an error: %d - %s\n", err, buf + 4);
 		return -1;
 	} else if (opcode != OP_ACK) {
 		printf("[TQFTP] Expected ACK, got %d\n", opcode);
@@ -444,15 +482,28 @@ static int handle_reader(struct tftp_client *client)
 	last = buf[2] << 8 | buf[3];
 	// printf("[TQFTP] Got ack for %d\n", last);
 
+	/* We've sent enough data for rsize already */
+	if (last * client->blksize > client->rsize)
+		return 0;
+
 	for (block = last; block < last + client->wsize; block++) {
+		size_t offset = client->seek + block * client->blksize;
+		size_t rsize = 0;
+		/* Check if need to limit response size based for requested rsize */
+		if (block * client->blksize + client->blksize > client->rsize)
+			rsize = client->rsize - (block * client->blksize);
+
 		n = tftp_send_data(client, block + 1,
-				   block * client->blksize);
+				   offset, rsize);
 		if (n < 0) {
 			printf("[TQFTP] Sent block %d failed: %zd\n", block + 1, n);
 			break;
 		}
 		// printf("[TQFTP] Sent block %d of %zd\n", block + 1, n);
 		if (n == 0)
+			break;
+		/* We've sent enough data for rsize already */
+		if (block * client->blksize + client->blksize > client->rsize)
 			break;
 	}
 
